@@ -5,6 +5,7 @@ A collection of skills I use with Claude Code to improve my life in various ways
 ## Skills
 
 - [`summarize/`](./summarize) — drop in a YouTube video, article, PDF, EPUB, or podcast and it writes a summary note into your vault with wikilinks to every person and concept mentioned. Asks detailed vs minimal mode on each run — detailed creates reference notes for every wikilink, minimal leaves them dangling and saves ~85% tokens.
+- [`creator-digest/`](./creator-digest) — turns `summarize` into a scheduled feed. List the channels, people, and topics you follow in one vault note; every few days it finds their new videos itself (no pasted links), fetches transcripts with scripts, and writes a compact takeaway digest. Mark a channel `deep` for full `/summarize` notes. Capped and script-driven so it stays cheap.
 - [`summarize-call/`](./summarize-call) — drop in a call recording (video or audio) and it transcribes with speaker labels, summarizes, and writes a call note + transcript + person notes for the participants. Same detailed / minimal mode as `summarize`.
 
 ## Daily Briefs 
@@ -28,6 +29,14 @@ For an automatic daily run, set up a recurring task:
 - **`/loop`** — runs locally on your machine (machine has to be on at the scheduled time)
 - **`/schedule`** — runs in the cloud (works while your machine is off on their servers)
 
+## Scheduling the creator digest
+
+1. Copy `vault/01 Updates/📺 Creator Feed.md` into your vault (easy-mode install does this) and fill in the `watchlist` block.
+2. Try it once by hand: `/creator-digest dry-run`, then `/creator-digest`.
+3. Schedule it. Prefer **`/loop`** (local): the digest needs `yt-dlp` and, for `subscriptions: true`, your browser cookies, and YouTube often blocks cloud IPs. Example: `/loop 3d /creator-digest`. `/schedule` (cloud) only suits public channels and may hit bot checks.
+
+Control cost with `max_videos` in the watchlist (default 6 per run). Read the digest, then say `deep <title>` on anything worth a full note.
+
 ## Optional Obsidian plugins
 
 Two Obsidian plugins that pair well with the skills — see [`obsidian-plugins/`](./obsidian-plugins) for details:
@@ -40,7 +49,7 @@ Two Obsidian plugins that pair well with the skills — see [`obsidian-plugins/`
 Open Claude Code in any directory and paste this:
 
 ```
-Install the ai-life-skills pack from https://github.com/reysu/ai-life-skills. Clone the repo to ~/src/ai-life-skills, ask me where I want the new Obsidian vault to live, create the vault folder with the full folder structure the skills expect, symlink every skill in the repo into ~/.claude/skills/, copy vault/CLAUDE.md from the repo to the new vault's root, copy the daily-brief and daily-news prompt-callout templates from vault/01 Updates/ into the vault's 01 Updates/ folder, and ask me whether to also install the bundled unread-dot Obsidian plugin into the vault's .obsidian/plugins/ folder.
+Install the ai-life-skills pack from https://github.com/reysu/ai-life-skills. Clone the repo to ~/src/ai-life-skills, ask me where I want the new Obsidian vault to live, create the vault folder with the full folder structure the skills expect, symlink every skill in the repo (`summarize`, `summarize-call`, `creator-digest`) into ~/.claude/skills/, copy vault/CLAUDE.md from the repo to the new vault's root, copy the daily-brief and daily-news prompt-callout templates from vault/01 Updates/ into the vault's 01 Updates/ folder, and ask me whether to also install the bundled unread-dot Obsidian plugin into the vault's .obsidian/plugins/ folder.
 ```
 
 Claude will:
@@ -71,6 +80,7 @@ git clone https://github.com/reysu/ai-life-skills ~/src/ai-life-skills
 ln -s ~/src/ai-life-skills/summarize ~/.claude/skills/summarize
 # or:
 ln -s ~/src/ai-life-skills/summarize-call ~/.claude/skills/summarize-call
+ln -s ~/src/ai-life-skills/creator-digest ~/.claude/skills/creator-digest   # also needs summarize
 ```
 
 The skills share a `templates/` folder at the repo root — leave it where it is, both skills reference it with a relative path.
