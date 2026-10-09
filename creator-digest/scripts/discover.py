@@ -9,13 +9,13 @@
 Candidates are only marked "seen" by `mark`, so a crashed run loses nothing.
 Needs yt-dlp on PATH. Stdlib only otherwise.
 """
-import argparse, json, re, subprocess, sys, urllib.request
+import argparse, json, re, subprocess, sys, urllib.parse, urllib.request
 import xml.etree.ElementTree as ET
 from datetime import date, datetime, timedelta
 from pathlib import Path
 
 DEFAULTS = {"lookback_days": 3, "max_videos": 6, "min_minutes": 8,
-            "max_minutes": 240, "browser": "", "per_source": 10}
+            "max_minutes": 240, "browser": "", "per_source": 10, "start_date": ""}
 MAX_CATCHUP_DAYS = 14
 BACKLOG_TTL_DAYS = 14
 ATOM = {"a": "http://www.w3.org/2005/Atom", "yt": "http://www.youtube.com/xml/schemas/2015"}
@@ -76,9 +76,18 @@ def resolve_channel_id(value, state, browser):
     if value in cache:
         return cache[value]
     m = re.search(r"(UC[\w-]{22})", value)
-    cid = m.group(1) if m else ytdlp(
-        ["--flat-playlist", "-I", "1", "--print", "%(channel_id)s", channel_url(value) + "/videos"],
-        browser).strip().splitlines()[:1]
+    if m:
+        cid = m.group(1)
+    elif " " in value:  # plain channel name: take the top channel-filtered search result
+        q = urllib.parse.quote_plus(value)
+        cid = ytdlp(["--flat-playlist", "-I", "1", "--print", "%(channel_id)s %(channel)s",
+                     f"https://www.youtube.com/results?search_query={q}&sp=EgIQAg%3D%3D"], browser).strip().splitlines()[:1]
+        if cid:
+            cid, _, name = cid[0].partition(" ")
+            state.setdefault("channel_names", {})[value] = name
+    else:
+        cid = ytdlp(["--flat-playlist", "-I", "1", "--print", "%(channel_id)s", channel_url(value) + "/videos"],
+                    browser).strip().splitlines()[:1]
     cid = cid if isinstance(cid, str) else (cid[0] if cid else "")
     if cid:
         cache[value] = cid
@@ -150,6 +159,8 @@ def cmd_find(a):
     if state.get("last_run"):
         since = min(since, date.fromisoformat(state["last_run"]) - timedelta(days=1))
     since = max(since, today - timedelta(days=MAX_CATCHUP_DAYS))
+    if settings["start_date"]:  # never summarize anything uploaded before the schedule started
+        since = max(since, date.fromisoformat(settings["start_date"]))
 
     cand = {}  # id -> {"srcs": [(src, rank)]}
     def add(vid, src):
@@ -208,7 +219,8 @@ def cmd_find(a):
     state["backlog"] = [dict(b, queued=b.get("queued", today.isoformat())) for b in backlog]
     save(a.state, state)
     json.dump({"process": process, "backlog": backlog, "stats": stats,
-               "since": since.isoformat(), "settings": settings}, sys.stdout, indent=1, ensure_ascii=False)
+               "since": since.isoformat(), "settings": settings,
+               "resolved_channels": state.get("channel_names", {})}, sys.stdout, indent=1, ensure_ascii=False)
 
 
 def cmd_mark(a):

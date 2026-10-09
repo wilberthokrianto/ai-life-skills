@@ -36,6 +36,8 @@ Optional, from the invocation: `--max N` (override `max_videos`), `--lookback N`
 python3 "$SCRIPTS/discover.py" find --watchlist "$VAULT_ROOT/$FEED_NOTE" --state "$VAULT_ROOT/$STATE_FILE"
 ```
 
+`start_date` in the watchlist is a floor: nothing uploaded before it is ever picked up. A channel written as a plain name (with spaces) is resolved by search, and `resolved_channels` in the output shows which channel it picked. On first run, show the user that mapping and confirm before summarizing.
+
 Returns JSON: `process` (up to `max_videos` videos), `backlog` (over the cap, carried to next run), `stats` (what the filters dropped), `since`.
 
 What the script already did, so you do not redo it:

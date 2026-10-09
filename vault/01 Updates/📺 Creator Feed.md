@@ -23,7 +23,7 @@ unread: false
 > | `topic: some keywords` | Any new video containing all the words. Noisy — add `\| min_views=20000`. |
 > | `subscriptions: true` | Everything in your real YouTube subscriptions feed. Needs `browser:` set (logged-in cookies). |
 >
-> **Settings** (same block): `lookback_days` (first run window), `max_videos` (hard cap per run — the main token control), `min_minutes` / `max_minutes` (duration filter, drops Shorts and 8-hour streams), `browser` (e.g. `chrome`), `per_source` (how many recent videos to check per source).
+> **Settings** (same block): `lookback_days` (first run window), `max_videos` (hard cap per run — the main token control), `min_minutes` / `max_minutes` (duration filter, drops Shorts and 8-hour streams), `browser` (e.g. `chrome`), `per_source` (how many recent videos to check per source), `start_date` (YYYY-MM-DD floor: older uploads are never summarized).
 >
 > **Output format** — newest run at the top, older runs collapsed, same convention as the other `01 Updates/` notes:
 > - Run heading: `### [[MM-DD-YY Day]]`
@@ -33,16 +33,21 @@ unread: false
 > - Group runs under `## YYYY-MM`; set `unread: true` and update `updated:` when adding entries
 
 ```watchlist
-# lookback_days: 3
-# max_videos: 6
-# min_minutes: 8
-# max_minutes: 240
+start_date: 2026-10-09
+max_videos: 6
+min_minutes: 8
+max_minutes: 240
+per_source: 10
 # browser: chrome
-# per_source: 10
 
-# channel: @lexfridman | deep
-# channel: @AndrejKarpathy
-# person: Sam Altman
-# topic: AI agents | min_views=20000
-# subscriptions: true
+channel: Raymond Chin
+channel: @DiaryOfACEO
+channel: I Will Teach You To Be Rich
+channel: Leon Hartono
+
+person: Bevan Pramudito
+person: Mohnish Pabrai
+person: Guy Spier
+person: Morgan Housel
+person: Naval Ravikant
 ```
