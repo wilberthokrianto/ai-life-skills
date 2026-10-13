@@ -18,20 +18,17 @@
       Adds `- [[T]] - DATE - H` to 08 Summaries/<CH>/<CH>.md, newest first
       (creates the hub if missing; no-op if T is already listed). Prints HUB <path>.
 """
-import argparse, json, re, sys
+import argparse, json, math, re, sys
 from datetime import date
 from pathlib import Path
 
 SUMMARIES_DIR = "08 Summaries"
 PEOPLE_DIR = "04 People"
 MAX_LINKS = 10
-# (max source words, summary words, sections, tldr sentences): about a third of the transcript,
-# ~3000 summary words per hour of video. The last tier also covers longer transcripts.
-# verify_note.py imports these, so this is the one place to change them.
-TIERS = [(1500, (300, 500), (2, 3), "2"),
-         (5000, (700, 1600), (4, 6), "3"),
-         (15000, (1800, 4500), (6, 12), "3-4"),
-         (float("inf"), (5000, 8000), (12, 20), "4-5")]
+# Length targets from the transcript word count W. verify_note.py imports target(),
+# so this is the one place to change them.
+SUMMARY_MIN, SUMMARY_MAX = 0.07, 0.15   # share of W
+SUMMARY_FLOOR, SUMMARY_CAP = 150, 3000  # floor on both ends; cap on the max
 FORBIDDEN = r'[|#^\[\]:/\\?"*<>]'
 
 
@@ -40,9 +37,12 @@ def sanitize(name):
 
 
 def target(words):
-    for limit, w, s, t in TIERS:
-        if words < limit:
-            return w, s, t
+    """((min, max) summary words, (min, max) sections, tldr sentences) for a W-word transcript."""
+    wmax = min(SUMMARY_CAP, max(SUMMARY_FLOOR, round(words * SUMMARY_MAX)))
+    wmin = min(wmax, max(SUMMARY_FLOOR, round(words * SUMMARY_MIN)))
+    sections = (max(1, math.ceil(words / 2500)), max(1, math.ceil(words / 1500)))
+    tldr = 2 if words < 5000 else 3 if words < 15000 else 4
+    return (wmin, wmax), sections, tldr
 
 
 def mmss(sec):

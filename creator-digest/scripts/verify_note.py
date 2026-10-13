@@ -8,7 +8,7 @@
 Target summary words come from the transcript word count (--source-words, same tiers as
 plan.py), or are given directly with --min/--max. Word count = body words, excluding
 frontmatter and fenced code blocks (the vid embed). Allowed range is the target range
-widened to -25% / +35%.
+widened by 10% on each side.
 --headline: also check the worker's report HEADLINE (<= 160 characters, one line).
 --words: print only `WORDS <n>` (the body word count) and exit; for the worker's report.
 """
@@ -16,7 +16,7 @@ import argparse, re, sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from plan import target  # noqa: E402  (single source of truth for the length tiers)
+from plan import target  # noqa: E402  (single source of truth for the length formula)
 
 REQUIRED = ["created", "updated", "date", "summary", "categories", "unread", "tags",
             "recording", "views", "duration", "uploaded", "creator", "people"]
@@ -25,6 +25,7 @@ FORBIDDEN = set('|#^[]:/\\?"*<>')
 MAX_LINKS = 10
 MAX_SUMMARY = 70
 MAX_HEADLINE = 160
+TOLERANCE = 0.10  # allowed slack around the target word range
 
 
 def main():
@@ -85,7 +86,7 @@ def main():
             problems.append("headline must be one line")
         elif len(h) > MAX_HEADLINE:
             problems.append(f"headline is {len(h)} chars (max {MAX_HEADLINE})")
-    lo, hi = int(a.min * 0.75), int(a.max * 1.35)
+    lo, hi = int(a.min * (1 - TOLERANCE)), int(a.max * (1 + TOLERANCE))
     if not lo <= words <= hi:
         problems.append(f"body is {words} words (allowed {lo}-{hi}, target {a.min}-{a.max})")
     for p in problems:

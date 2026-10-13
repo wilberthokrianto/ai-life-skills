@@ -49,6 +49,7 @@ What the script already did, so you do not redo it:
 - Channels via free RSS (id cached after first lookup), people/topics via the upload-date-sorted results page
 - Dropped: already seen, older than the window, Shorts / too short, too long (unless `long`), live/upcoming, and search hits that do not actually name the person or all topic words
 - Ranked: explicit channels/subscriptions first, then search hits, newest first
+- Remembered: every person/topic hit that passed the filters is saved in the state backlog until it is marked or 14 days old, because the same search may not return it next time
 
 If `process` is empty, write nothing to the feed, report "nothing new" with the `stats`, run `finish` (Step 7), and stop. Quiet days must cost almost nothing.
 
@@ -75,16 +76,12 @@ python3 "$SCRIPTS/plan.py" plan --find "$SCRATCH/find.json" --transcripts "$SCRA
 Prints, per video, `VIDEO / META / TRANSCRIPT / WORDS / WRITE / OUTPUT / TARGET / STATUS` lines, then `COLLISION <person> <ids>` and `NO_TRANSCRIPT <id> <error>` lines. Everything the worker needs comes from these lines:
 
 - `OUTPUT` is `08 Summaries/<Channel>/Summaries/<Title>.md` with `| # ^ [ ] : / \ ? " * < >` removed. The note's wikilink name is that filename without `.md`.
-- `TARGET` comes from the transcript word count:
+- `TARGET` is a formula on the transcript word count W:
+  - summary words: 7% to 15% of W (never below 150; the max is capped at 3,000)
+  - sections: ceil(W/2500) to ceil(W/1500), at least 1
+  - tldr: 2 sentences if W < 5,000, 3 if W < 15,000, else 4
 
-| Transcript words | Summary words | Sections | TLDR sentences |
-|---|---|---|---|
-| <1,500 | 300-500 | 2-3 | 2 |
-| 1,500-5,000 | 700-1,600 | 4-6 | 3 |
-| 5,000-15,000 | 1,800-4,500 | 6-12 | 3-4 |
-| 15,000+ | 5,000-8,000 | 12-20 | 4-5 |
-
-About a third of the transcript, ~3,000 summary words per hour of video. The tiers live in `plan.py` (`TIERS`); `verify_note.py` imports them, so change them there only.
+  For example, a 50-minute talk (~8,700 words) gets 611-1,310 words in 4-6 sections; a 2-hour podcast (~21,000 words) gets 1,467-3,000 in 9-14. `verify_note.py` allows 10% either side. The formula lives in `plan.py` (`target()`); `verify_note.py` imports it, so change it there only.
 
 - `WRITE` is the note language: the transcript's language, unless the source has `| write=id` or `| write=en` in the watchlist.
 - `STATUS exists` -> **skip** that video (already summarized); it still counts as done.
@@ -113,9 +110,11 @@ same time: never create or rewrite their person note wholesale; append only.">
 
 1. Read the transcript (in chunks if it is long).
 
-   DEPTH: this is a detailed note, not a high-level summary. Keep every argument, example,
-   number, name, story and timestamp; cut only filler, repetition and small talk. Use many
-   ## sections (TARGETS), each with its timestamp, and > [!quote] callouts for the best lines.
+   DEPTH: keep the concrete juice: arguments, numbers, names, stories, and the best quotes
+   with their timestamps. Cut filler and repetition. Stay inside TARGETS.
+   ACCURACY: auto-captions mishear. If a name, company or number is not clear in the
+   captions, write it with (?) after it, e.g. "PT Bumi Resources (?)", or leave it out.
+   Never guess, and never wikilink a (?) name.
 
 2. Write the note at OUTPUT (summarize skill, MINIMAL mode):
    FRONTMATTER: created + updated (YYYY-MM-DDTHH:mm, now), date (= uploaded), summary
@@ -206,7 +205,7 @@ python3 "$SCRIPTS/discover.py" finish --state "$VAULT_ROOT/$STATE_FILE"
 | Discovery, transcripts, planning, verification are scripts | 0 tokens until a transcript is read by its worker |
 | Orchestrator never reads transcripts or notes | Main context stays small however many videos run |
 | One Sonnet worker per video, no fan-out | Cost scales with transcript length, nothing more |
-| `max_videos` cap + backlog | **The main control**: each video is now a full note (a 2-hour podcast is a 5k-8k word note). Keep it at 3-4 for scheduled runs |
+| `max_videos` cap + backlog | **The main control**: each video is now a full note (a 2-hour podcast is a note of up to 3,000 words). Keep it at 3-4 for scheduled runs |
 | `min_minutes` / `max_minutes` | Drops Shorts and 8-hour streams before anything is read |
 | Seen-state + `STATUS exists` | A video is never summarized twice |
 | No audio transcription when scheduled | The expensive fallback never runs unattended |

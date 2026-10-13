@@ -194,7 +194,7 @@ def save(path, state):
 
 def matches(src, meta):
     """Cheap relevance gate for person/topic searches (no tokens)."""
-    hay = " ".join([meta["title"], meta["channel"], meta["desc"]]).casefold()
+    hay = " ".join([meta["title"], meta["channel"], meta.get("desc", "")]).casefold()
     q = src["value"].casefold()
     if src["kind"] == "person":
         return q in hay
@@ -296,7 +296,8 @@ def cmd_find(a):
         if m["duration"] > settings["max_minutes"] * 60 and not any(s["opts"].get("long") for s in srcs):
             stats["too_long"] += 1; continue
         gated = [s for s in srcs if s["kind"] in ("person", "topic")]
-        if gated and not any(s["kind"] in ("channel", "subscriptions") for s in srcs):
+        # a remembered backlog hit already passed this gate when it was first found
+        if gated and vid not in backlog_prev and not any(s["kind"] in ("channel", "subscriptions") for s in srcs):
             if not any(matches(s, m) and m["views"] >= int(s["opts"].get("min_views", 0) or 0) for s in gated):
                 stats["irrelevant"] += 1; continue
         if any(s["opts"].get("deep") for s in srcs):
@@ -314,9 +315,16 @@ def cmd_find(a):
         return (not explicit, m.get("uploaded", "") and -int(m["uploaded"].replace("-", "")))
     ordered = sorted(pool.values(), key=rank)
     process, backlog = ordered[:settings["max_videos"]], ordered[settings["max_videos"]:]
-    state["backlog"] = [dict(b, queued=b.get("queued", today.isoformat())) for b in backlog]
+    # Search results are unstable: a hit found today may not come back tomorrow. So every
+    # person/topic hit that passed the filters is remembered in the backlog (not just the
+    # over-cap ones) until `mark` removes it or it is BACKLOG_TTL_DAYS old.
+    def from_search(m):
+        return not any(s.startswith(("channel:", "subscriptions:")) for s in m.get("sources", []))
+    remember = backlog + [m for m in process if from_search(m)]
+    state["backlog"] = [dict(b, queued=b.get("queued", today.isoformat())) for b in remember]
     save(a.state, state)
-    progress(f"done: {len(process)} to process, {len(backlog)} in backlog")
+    progress(f"done: {len(process)} to process, {len(backlog)} in backlog, "
+             f"{len(remember) - len(backlog)} search hit(s) remembered until processed")
     json.dump({"process": process, "backlog": backlog, "stats": stats,
                "since": since.isoformat(), "settings": settings,
                "resolved_channels": state.get("channel_names", {})}, sys.stdout, indent=1, ensure_ascii=False)
