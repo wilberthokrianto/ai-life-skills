@@ -56,11 +56,11 @@ One short line to the user (or the run log when scheduled): `N new videos (M dee
 For each video in `process`, in parallel (Bash background jobs or one loop):
 
 ```bash
-python3 "$SCRIPTS/transcript.py" <id> --out "$SCRATCH" --browser "<settings.browser>"
+python3 "$SCRIPTS/transcript.py" <id> --out "$SCRATCH" --lang "<settings.lang>" --browser "<settings.browser>"
 ```
 
 - Result `error: no_captions` -> **skip, do not transcribe audio** in a scheduled run (that is the expensive path). Mark `skipped`, list it in the digest as a title-only line with `[Watch](url)` so nothing silently disappears. Offer `/summarize <url>` for it interactively.
-- Manual captions beat auto captions (the script already picks them).
+- Caption language follows `lang` in the watchlist (default `en, id`): uploaded captions in that order, then the video's original-language auto captions, then auto (possibly machine-translated) ones. The result's `lang` says which was used.
 
 ## Step 4: Summarize (the only token spend)
 
@@ -74,6 +74,7 @@ Subagent instructions:
 > `QUOTE:` optional, one line worth keeping, with speaker and `[M:SS]`.
 > `THEME:` 2-4 words.
 > Wikilink only people and named things that are central; do not wikilink generic terms.
+> Write everything in English, even when the transcript is in another language (e.g. Indonesian): translate the QUOTE into English too.
 
 N by duration: under 20 min = 3, 20-60 min = 4, over 60 min = 5. Transcripts over ~40k words: the subagent reads in chunks and merges; do not fan out into more agents.
 

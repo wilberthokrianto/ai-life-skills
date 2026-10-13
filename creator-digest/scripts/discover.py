@@ -11,14 +11,20 @@ Needs yt-dlp on PATH. Stdlib only otherwise.
 """
 import argparse, json, re, subprocess, sys, urllib.parse, urllib.request
 import xml.etree.ElementTree as ET
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import date, datetime, timedelta
 from pathlib import Path
 
 DEFAULTS = {"lookback_days": 3, "max_videos": 6, "min_minutes": 8,
-            "max_minutes": 240, "browser": "", "per_source": 10, "start_date": ""}
+            "max_minutes": 240, "browser": "", "per_source": 10, "start_date": "",
+            "lang": "en, id"}
 MAX_CATCHUP_DAYS = 14
 BACKLOG_TTL_DAYS = 14
 ATOM = {"a": "http://www.w3.org/2005/Atom", "yt": "http://www.youtube.com/xml/schemas/2015"}
+
+
+def progress(msg):
+    print(msg, file=sys.stderr, flush=True)
 
 
 def parse_watchlist(path):
@@ -50,8 +56,12 @@ def parse_watchlist(path):
 
 
 def run(cmd):
-    r = subprocess.run(cmd, capture_output=True, text=True)
-    return r.stdout if r.returncode == 0 or r.stdout else ""
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
+        return r.stdout if r.returncode == 0 or r.stdout else ""
+    except subprocess.TimeoutExpired:
+        progress(f"timeout: {' '.join(str(c) for c in cmd)[:80]}")
+        return ""
 
 
 def ytdlp(args, browser):
@@ -71,10 +81,31 @@ def channel_url(value):
     return f"https://www.youtube.com/@{value}"
 
 
+def _scrape_channel_id(handle_url):
+    """Try to extract UC channel ID from a YouTube @handle page via urllib. Returns "" on failure."""
+    req = urllib.request.Request(handle_url, headers={"User-Agent": "Mozilla/5.0"})
+    try:
+        with urllib.request.urlopen(req, timeout=15) as r:
+            html = r.read().decode("utf-8", errors="replace")
+    except Exception:
+        return ""
+    # The page's own id only; a bare "channelId" can be a featured channel (e.g. a Clips channel)
+    for pat in (r'<link rel="canonical" href="https://www\.youtube\.com/channel/(UC[\w-]{22})"',
+                r'"externalId"\s*:\s*"(UC[\w-]{22})"'):
+        m = re.search(pat, html)
+        if m:
+            return m.group(1)
+    return ""
+
+
+CHANNEL_ID_RE = re.compile(r"^UC[\w-]{22}$")
+
+
 def resolve_channel_id(value, state, browser):
     cache = state.setdefault("channel_ids", {})
-    if value in cache:
+    if CHANNEL_ID_RE.match(cache.get(value, "")):
         return cache[value]
+    cache.pop(value, None)  # drop a bad cached id ("NA", empty) and re-resolve
     m = re.search(r"(UC[\w-]{22})", value)
     if m:
         cid = m.group(1)
@@ -86,22 +117,34 @@ def resolve_channel_id(value, state, browser):
             cid, _, name = cid[0].partition(" ")
             state.setdefault("channel_names", {})[value] = name
     else:
-        cid = ytdlp(["--flat-playlist", "-I", "1", "--print", "%(channel_id)s", channel_url(value) + "/videos"],
-                    browser).strip().splitlines()[:1]
+        # @handle or bare name without spaces: try a fast urllib scrape first
+        cid = _scrape_channel_id(channel_url(value))
+        if not cid:
+            cid = ytdlp(["--flat-playlist", "-I", "1", "--print", "%(playlist_channel_id)s", channel_url(value) + "/videos"],
+                        browser).strip().splitlines()[:1]
     cid = cid if isinstance(cid, str) else (cid[0] if cid else "")
-    if cid:
-        cache[value] = cid
+    if not CHANNEL_ID_RE.match(cid):  # yt-dlp prints "NA" for a missing field
+        return ""
+    cache[value] = cid
     return cid
 
 
-def rss_ids(channel_id):
+def rss_entries(channel_id):
+    """Fetch RSS and return list of (id, published_date_str) pairs. Returns None on failure."""
     url = f"https://www.youtube.com/feeds/videos.xml?channel_id={channel_id}"
     try:
         with urllib.request.urlopen(url, timeout=20) as r:
             root = ET.fromstring(r.read())
     except Exception:
         return None
-    return [e.findtext("yt:videoId", namespaces=ATOM) for e in root.findall("a:entry", ATOM)]
+    results = []
+    for e in root.findall("a:entry", ATOM):
+        vid = e.findtext("yt:videoId", namespaces=ATOM)
+        published = e.findtext("a:published", namespaces=ATOM)  # e.g. "2026-10-08T18:00:00+00:00"
+        pub_date = published[:10] if published else ""
+        if vid:
+            results.append((vid, pub_date))
+    return results
 
 
 def flat_ids(args, browser):
@@ -109,10 +152,8 @@ def flat_ids(args, browser):
     return [l.split("\t") for l in out.splitlines() if l.count("\t") >= 2]
 
 
-def metadata(ids, browser):
-    """One yt-dlp call for many ids. Returns {id: meta}."""
-    if not ids:
-        return {}
+def metadata_chunk(ids, browser):
+    """Fetch metadata for a list of ids. Returns {id: meta}."""
     fmt = "%(id)s\t%(title)s\t%(duration)s\t%(upload_date)s\t%(view_count)s\t%(channel)s\t%(live_status)s\t%(description).400s"
     out = ytdlp(["--skip-download", "--print", fmt] + [f"https://www.youtube.com/watch?v={i}" for i in ids], browser)
     res = {}
@@ -126,6 +167,19 @@ def metadata(ids, browser):
                     "views": int(views) if views.isdigit() else 0,
                     "uploaded": f"{up[:4]}-{up[4:6]}-{up[6:]}" if len(up) == 8 else "",
                     "url": f"https://www.youtube.com/watch?v={vid}", "desc": desc}
+    return res
+
+
+def metadata(ids, browser, chunk_size=10, workers=4):
+    """Parallel metadata fetch in chunks of chunk_size, up to workers threads."""
+    if not ids:
+        return {}
+    chunks = [ids[i:i + chunk_size] for i in range(0, len(ids), chunk_size)]
+    res = {}
+    with ThreadPoolExecutor(max_workers=workers) as ex:
+        futs = {ex.submit(metadata_chunk, chunk, browser): chunk for chunk in chunks}
+        for fut in as_completed(futs):
+            res.update(fut.result())
     return res
 
 
@@ -147,6 +201,46 @@ def matches(src, meta):
     return all(t in hay for t in re.findall(r"\w+", q))
 
 
+def fetch_source(src, state, browser, per, since, since_yyyymmdd):
+    """Fetch candidate IDs for one source. Returns list of (vid, src) pairs and any state updates."""
+    k = src["kind"]
+    pairs = []
+    state_updates = {}  # channel_ids / channel_names to merge back
+    if k == "channel":
+        # resolve_channel_id mutates state; snapshot the local cache first
+        local_state = {"channel_ids": dict(state.get("channel_ids", {})),
+                       "channel_names": dict(state.get("channel_names", {}))}
+        cid = resolve_channel_id(src["value"], local_state, browser)
+        state_updates["channel_ids"] = local_state.get("channel_ids", {})
+        state_updates["channel_names"] = local_state.get("channel_names", {})
+        entries = rss_entries(cid) if cid else None
+        if entries is None:
+            ids = [r[0] for r in flat_ids(["-I", f"1:{per}", channel_url(src["value"]) + "/videos"], browser)]
+            for vid in ids[:per]:
+                pairs.append((vid, src))
+            progress(f"channel {src['value']}: {len(pairs)} candidates (fallback)")
+        else:
+            for vid, pub_date in entries[:per]:
+                if pub_date and pub_date < since.isoformat():
+                    continue
+                pairs.append((vid, src))
+            progress(f"channel {src['value']}: {len(pairs)} new (since {since.isoformat()})")
+    elif k in ("person", "topic"):
+        # ytsearchdate was removed from yt-dlp; use the results page sorted by upload date (sp=CAI%3D)
+        q = urllib.parse.quote_plus(src["value"])
+        rows = flat_ids(["-I", f"1:{per}", f"https://www.youtube.com/results?search_query={q}&sp=CAI%3D"], browser)
+        videos = [r for r in rows if re.fullmatch(r"[\w-]{11}", r[0])]  # drop channel/playlist hits
+        for r in videos:
+            pairs.append((r[0], src))
+        progress(f"{k} {src['value']!r}: {len(rows)} raw results, {len(videos)} videos")
+    elif k == "subscriptions":
+        rows = flat_ids(["-I", f"1:{per * 4}", ":ytsubs"], browser)
+        for r in rows:
+            pairs.append((r[0], src))
+        progress(f"subscriptions: {len(rows)} candidates")
+    return pairs, state_updates
+
+
 def cmd_find(a):
     settings, sources = parse_watchlist(a.watchlist)
     if a.lookback: settings["lookback_days"] = a.lookback
@@ -162,30 +256,32 @@ def cmd_find(a):
     if settings["start_date"]:  # never summarize anything uploaded before the schedule started
         since = max(since, date.fromisoformat(settings["start_date"]))
 
-    cand = {}  # id -> {"srcs": [(src, rank)]}
+    since_yyyymmdd = since.strftime("%Y%m%d")
+
+    cand = {}  # id -> [src, ...]
     def add(vid, src):
         if vid and vid not in seen:
             cand.setdefault(vid, []).append(src)
 
-    for src in sources:
-        k = src["kind"]
-        if k == "channel":
-            cid = resolve_channel_id(src["value"], state, browser)
-            ids = rss_ids(cid) if cid else None
-            if ids is None:  # RSS failed: fall back to the channel's /videos tab
-                ids = [r[0] for r in flat_ids(["-I", f"1:{per}", channel_url(src["value"]) + "/videos"], browser)]
-            for vid in ids[:per]:
+    # Fetch all sources in parallel (each source is one or two network calls)
+    with ThreadPoolExecutor(max_workers=6) as ex:
+        futs = {ex.submit(fetch_source, src, state, browser, per, since, since_yyyymmdd): src
+                for src in sources}
+        for fut in as_completed(futs):
+            pairs, updates = fut.result()
+            for vid, src in pairs:
                 add(vid, src)
-        elif k in ("person", "topic"):
-            for r in flat_ids([f"ytsearchdate{per}:{src['value']}"], browser):
-                add(r[0], src)
-        elif k == "subscriptions":
-            for r in flat_ids(["-I", f"1:{per * 4}", ":ytsubs"], browser):
-                add(r[0], src)
+            # Merge state updates (channel ID cache) from worker threads
+            for k, v in updates.items():
+                state.setdefault(k, {}).update(v)
 
     backlog_prev = {b["id"]: b for b in state.get("backlog", [])
                     if date.fromisoformat(b["queued"]) >= today - timedelta(days=BACKLOG_TTL_DAYS)}
-    meta = metadata([v for v in cand if v not in backlog_prev], browser)
+    ids_to_fetch = [v for v in cand if v not in backlog_prev]
+    progress(f"fetching metadata for {len(ids_to_fetch)} candidates (parallel)…")
+    meta = metadata(ids_to_fetch, browser)
+    progress(f"metadata done: {len(meta)} returned")
+
     stats = {"scanned": len(cand), "seen_skipped": 0, "too_old": 0, "too_short": 0,
              "too_long": 0, "live": 0, "irrelevant": 0}
     pool = {}
@@ -218,6 +314,7 @@ def cmd_find(a):
     process, backlog = ordered[:settings["max_videos"]], ordered[settings["max_videos"]:]
     state["backlog"] = [dict(b, queued=b.get("queued", today.isoformat())) for b in backlog]
     save(a.state, state)
+    progress(f"done: {len(process)} to process, {len(backlog)} in backlog")
     json.dump({"process": process, "backlog": backlog, "stats": stats,
                "since": since.isoformat(), "settings": settings,
                "resolved_channels": state.get("channel_names", {})}, sys.stdout, indent=1, ensure_ascii=False)
