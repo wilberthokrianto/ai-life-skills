@@ -1,12 +1,17 @@
 ---
 name: creator-digest
-description: Scheduled YouTube digest. Reads a watchlist of channels, people, and topics from the vault, finds the new videos since the last run on its own (no pasted links), fetches transcripts with scripts, and writes a compact takeaway digest into the vault - with optional full /summarize notes for channels marked deep. Built to be cheap enough to run every few days. Use when the user wants to follow creators, run or set up the creator feed, or asks "what's new from the people I follow".
+description: Scheduled YouTube feed. Reads a watchlist of channels, people, and topics from the vault, finds the new videos since the last run on its own (no pasted links), fetches transcripts with scripts, and has one Sonnet worker per video write a full summary note (summarize minimal format) - then links them from the feed note, a per-creator hub, and the daily note. Use when the user wants to follow creators, run or set up the creator feed, or asks "what's new from the people I follow".
 user_invocable: true
 ---
 
 # Creator Digest
 
-Turns `summarize` from "paste a link" into "tell me what I missed." Discovery and transcript fetching are **scripts that cost zero tokens**; the model only reads transcripts to write takeaways, and a hard per-run cap bounds the spend.
+Turns `summarize` from "paste a link" into "tell me what I missed." Two tiers:
+
+- **Orchestrator (this conversation):** runs scripts, reads their short output lines, dispatches workers, and makes small edits (feed note, hub notes, daily note). It **never reads a transcript or a finished note**.
+- **Worker (one Sonnet subagent per video):** reads the transcript itself, writes the whole summary note, verifies it with a script, and reports one line.
+
+Discovery, transcripts, planning, and verification are **scripts that cost zero tokens** and print only short lines (paths, counts, problems), never content.
 
 ## Requirements
 
@@ -18,7 +23,7 @@ Runs best **locally** (a Mac that is on at the scheduled time): YouTube blocks m
 
 ```
 VAULT_ROOT   = $VAULT_ROOT        # resolve exactly as summarize Step 0a
-FEED_NOTE    = 01 Updates/📺 Creator Feed.md     # watchlist + digest live here
+FEED_NOTE    = 01 Updates/📺 Creator Feed.md     # watchlist + feed live here
 STATE_FILE   = 01 Updates/.creator-feed-state.json   # dotfile: seen ids, backlog, last_run
 SCRIPTS      = <this skill dir>/scripts
 SCRATCH      = a fresh temp dir for transcripts (deleted at the end)
@@ -28,81 +33,163 @@ If `FEED_NOTE` is missing, copy `vault/01 Updates/📺 Creator Feed.md` from the
 
 ## Inputs
 
-Optional, from the invocation: `--max N` (override `max_videos`), `--lookback N` (days), `dry-run` (steps 1-2 only, report what *would* be summarized), `deep <id|title>` (promote one already-digested video to a full note, see Step 5). Scheduled runs must never prompt interactively.
+Optional, from the invocation: `--max N` (override `max_videos`), `--lookback N` (days), `dry-run` (steps 1-2 only, report what *would* be summarized). Scheduled runs must never prompt interactively.
 
-## Step 1: Discover (script, no tokens)
+## Step 1: Discover (script)
 
 ```bash
-python3 "$SCRIPTS/discover.py" find --watchlist "$VAULT_ROOT/$FEED_NOTE" --state "$VAULT_ROOT/$STATE_FILE"
+python3 "$SCRIPTS/discover.py" find --watchlist "$VAULT_ROOT/$FEED_NOTE" --state "$VAULT_ROOT/$STATE_FILE" > "$SCRATCH/find.json"
 ```
 
 `start_date` in the watchlist is a floor: nothing uploaded before it is ever picked up. A channel written as a plain name (with spaces) is resolved by search, and `resolved_channels` in the output shows which channel it picked. On first run, show the user that mapping and confirm before summarizing.
 
-Returns JSON: `process` (up to `max_videos` videos), `backlog` (over the cap, carried to next run), `stats` (what the filters dropped), `since`.
+Returns JSON: `process` (up to `max_videos` videos), `backlog` (over the cap, carried to next run), `stats` (what the filters dropped), `since`, `settings`. Read only the fields you need (ids, titles, stats) with a one-line `python3 -c`, not the whole file.
 
 What the script already did, so you do not redo it:
-- Channels via free RSS (id cached after first lookup), people/topics via date-sorted search
+- Channels via free RSS (id cached after first lookup), people/topics via the upload-date-sorted results page
 - Dropped: already seen, older than the window, Shorts / too short, too long (unless `long`), live/upcoming, and search hits that do not actually name the person or all topic words
-- Ranked: `deep` channels first, then explicit channels/subscriptions, then search hits, newest first
+- Ranked: explicit channels/subscriptions first, then search hits, newest first
 
-If `process` is empty, write nothing to the feed, report "nothing new" with the `stats`, run `finish` (Step 6), and stop. Quiet days must cost almost nothing.
+If `process` is empty, write nothing to the feed, report "nothing new" with the `stats`, run `finish` (Step 7), and stop. Quiet days must cost almost nothing.
 
 ## Step 2: Report the plan
 
-One short line to the user (or the run log when scheduled): `N new videos (M deep), K in backlog, dropped: <stats>`. With `dry-run`, list titles and stop here.
+One short line to the user (or the run log when scheduled): `N new videos, K in backlog, dropped: <stats>`. With `dry-run`, list titles and stop here.
 
-## Step 3: Fetch transcripts (script, no tokens)
+## Step 3: Fetch transcripts (script)
 
-For each video in `process`, in parallel (Bash background jobs or one loop):
+All videos in parallel, one JSON line each, collected into one file:
 
 ```bash
-python3 "$SCRIPTS/transcript.py" <id> --out "$SCRATCH" --lang "<settings.lang>" --browser "<settings.browser>"
+for id in <ids>; do python3 "$SCRIPTS/transcript.py" "$id" --out "$SCRATCH" --lang "<settings.lang>" --browser "<settings.browser>" & done > "$SCRATCH/transcripts.jsonl"; wait
 ```
 
-- Result `error: no_captions` -> **skip, do not transcribe audio** in a scheduled run (that is the expensive path). Mark `skipped`, list it in the digest as a title-only line with `[Watch](url)` so nothing silently disappears. Offer `/summarize <url>` for it interactively.
-- Caption language follows `lang` in the watchlist (default `en, id`): uploaded captions in that order, then the video's original-language auto captions, then auto (possibly machine-translated) ones. The result's `lang` says which was used.
+Caption language follows `lang` in the watchlist (default `en, id`): uploaded captions in that order, then the video's original-language auto captions, then auto (possibly machine-translated) ones. `error: no_captions` -> **do not transcribe audio** in a scheduled run (that is the expensive path); the video is listed by title in the feed (Step 6) and marked `skipped`. Interactively, offer `/summarize <url>` for it.
 
-## Step 4: Summarize (the only token spend)
+## Step 4: Plan (script)
 
-**Never paste a transcript into the main conversation.** Dispatch one **Sonnet** subagent per video, in parallel, passing only the transcript *file path*, title, channel, duration, and the instructions below. The subagent returns text only. Never Haiku (same rule as `summarize`).
+```bash
+python3 "$SCRIPTS/plan.py" plan --find "$SCRATCH/find.json" --transcripts "$SCRATCH/transcripts.jsonl" --vault "$VAULT_ROOT"
+```
 
-Subagent instructions:
+Prints, per video, `VIDEO / META / TRANSCRIPT / WORDS / WRITE / OUTPUT / TARGET / STATUS` lines, then `COLLISION <person> <ids>` and `NO_TRANSCRIPT <id> <error>` lines. Everything the worker needs comes from these lines:
 
-> Read the transcript at `<path>`. Return, in this exact shape and nothing else:
-> `TLDR:` one sentence on the video's actual claim, not its topic.
-> `POINTS:` N bullets, each one concrete (a claim, number, mechanism, or decision, with the `[M:SS]` it comes from). No filler like "they discuss…".
-> `QUOTE:` optional, one line worth keeping, with speaker and `[M:SS]`.
-> `THEME:` 2-4 words.
-> Wikilink only people and named things that are central; do not wikilink generic terms.
-> Write everything in English, even when the transcript is in another language (e.g. Indonesian): translate the QUOTE into English too.
+- `OUTPUT` is `08 Summaries/<Channel>/Summaries/<Title>.md` with `| # ^ [ ] : / \ ? " * < >` removed. The note's wikilink name is that filename without `.md`.
+- `TARGET` comes from the transcript word count:
 
-N by duration: under 20 min = 3, 20-60 min = 4, over 60 min = 5. Transcripts over ~40k words: the subagent reads in chunks and merges; do not fan out into more agents.
+| Transcript words | Summary words | Sections | TLDR sentences |
+|---|---|---|---|
+| <1,500 | 300-500 | 2-3 | 2 |
+| 1,500-5,000 | 700-1,600 | 4-6 | 3 |
+| 5,000-15,000 | 1,800-4,500 | 6-12 | 3-4 |
+| 15,000+ | 5,000-8,000 | 12-20 | 4-5 |
 
-This is intentionally **not** the full `summarize` pipeline: no section-by-section pass, no reference notes, no Bases updates, no per-video note. That is what keeps a 6-video run at roughly the cost of 6 minimal summaries' *first pass* instead of 6 full vault expansions.
+About a third of the transcript, ~3,000 summary words per hour of video. The tiers live in `plan.py` (`TIERS`); `verify_note.py` imports them, so change them there only.
 
-## Step 5: Deep videos
+- `WRITE` is the note language: the transcript's language, unless the source has `| write=id` or `| write=en` in the watchlist.
+- `STATUS exists` -> **skip** that video (already summarized); it still counts as done.
+- `COLLISION` -> two or more videos in this batch share a creator or guest (guests are parsed from titles: "Ft. X", "feat. X", "... | X"). Warn the user in one line, and add the collision line to those workers' prompts (below). Every worker is append-only on existing person notes anyway.
 
-For videos from a `| deep` source (or one the user promotes with `deep <id>`), after Step 4 run the real skill in **minimal** mode on the URL so the full note, transcript note, and creator person note are created exactly as usual:
+## Step 5: Dispatch workers
 
-`/summarize <url> minimal`
+One `general-purpose` subagent with **`model: "sonnet"`** per `STATUS new` video, **all in parallel, in one message**. Never a bigger model, never Haiku, never a per-section fan-out. Fill the template completely; the worker sees nothing else:
 
-Pass `minimal` explicitly so a scheduled run never blocks on the depth prompt. Link the resulting note from the digest entry.
+```
+Write one Obsidian summary note for a YouTube video. Work only from files: read the
+transcript yourself and write the note directly to the vault. NEVER paste the transcript
+or the note into your reply.
 
-Promotion is the escape hatch for the cheap default: the user reads the digest, sees one video worth keeping, says `deep <title>`, and only then pays for the full note.
+SOURCE: <url>
+METADATA: title "<title>" | channel "<channel>" | duration <duration> | views <views> | uploaded <YYYY-MM-DD>
+TRANSCRIPT: <path> (<words> words, with [M:SS] / [H:MM:SS] markers about every 60s)
+VAULT_ROOT: <path>
+OUTPUT: <VAULT_ROOT>/<OUTPUT>   (create parent folders if needed)
+NOTE NAME: <OUTPUT filename without .md>   (use this in [[links]] to the note)
+TARGETS: <min>-<max> summary words, <a>-<b> sections, <n>-sentence tldr, MAX 10 wikilinks
+LANGUAGE: write the note in <Indonesian|English>. Frontmatter keys stay in English.
+VERIFY: python3 "<SCRIPTS>/verify_note.py" "<full OUTPUT path>" --source-words <words> --headline "<HEADLINE>"
+<only if a COLLISION names this video: "Another worker is writing about <person> at the
+same time: never create or rewrite their person note wholesale; append only.">
 
-## Step 6: Write the digest
+1. Read the transcript (in chunks if it is long).
 
-Edit `FEED_NOTE` following the format in its own prompt callout (that callout is the source of truth; if it differs from below, follow it):
+   DEPTH: this is a detailed note, not a high-level summary. Keep every argument, example,
+   number, name, story and timestamp; cut only filler, repetition and small talk. Use many
+   ## sections (TARGETS), each with its timestamp, and > [!quote] callouts for the best lines.
 
-- New run goes at the top, after the prompt and watchlist, under `## YYYY-MM`, heading `### [[MM-DD-YY ddd]]`
+2. Write the note at OUTPUT (summarize skill, MINIMAL mode):
+   FRONTMATTER: created + updated (YYYY-MM-DDTHH:mm, now), date (= uploaded), summary
+   (one line, <= 70 characters, in LANGUAGE), categories: ["[[posts.base]]"], unread: true,
+   tags: [youtube], recording: "<url>", views, duration, uploaded, creator: "[[<channel>]]",
+   people: [creators/guests only, as "[[Name]]"], guest: "[[Name]]" if there is one.
+   BODY: a ```vid <url>``` block first, then a > [!tldr] callout (TARGETS sentences), then
+   one ## section per topic in order, each heading ending with its [M:SS] start time,
+   each section's length proportional to its share of the video. Put standout lines in
+   > [!quote] callouts (speaker wikilink + timestamp; translate only if LANGUAGE differs
+   from the speaker's). End with ## People Mentioned (one bullet per person: who they are).
+   RULES: no "# Title" heading (the filename is the title); never repeat frontmatter facts
+   in the body; wikilink only people and central named things (companies, products, books),
+   at most 10 distinct links in the body; do not wikilink generic terms.
+
+3. Person notes, for the creator and each guest only ("<VAULT_ROOT>/04 People/<Name>.md"):
+   - Missing, and the name has 2+ words (e.g. "Boy Thohir", not "Juan"): create it from
+     "<VAULT_ROOT>/_Templates/new person template.md" with the shell so you never
+     overwrite one another worker just made:
+       set -o noclobber; cat > "<person note>" <<'NOTE' ... NOTE
+     Fill the bio from what the video says (no web research), unread: true, no "# " heading,
+     and under ## updates one line linking [[<NOTE NAME>]]. If the create fails because the
+     file now exists, treat it as existing. A one-word name: no person note and no wikilink,
+     plain text only.
+   - Existing: NEVER rewrite it. Only add one line under ## updates:
+       - <uploaded YYYY-MM-DD from METADATA>: <one line> [[<NOTE NAME>]]
+     (the video's UPLOAD date from METADATA, not today; same date in a new note's line)
+     If ## updates is the last heading, append with: printf '%s\n' "<line>" >> "<person note>"
+     Otherwise insert just that line with a single small edit right below "## updates".
+
+4. Write your HEADLINE (English, one line, the video's actual claim, <= 160 characters).
+   Run VERIFY with it. Fix every problem it prints (note or headline) and run it again,
+   until it prints nothing.
+
+5. Report back ONLY this one line:
+   PATH=<OUTPUT path> WORDS=<n from: VERIFY command + --words> HEADLINE=<the verified headline>
+```
+
+If a worker reports problems it could not fix, run VERIFY yourself once to get the problem lines and report them; do not open the note.
+
+## Step 6: Views (orchestrator, small edits only)
+
+Use only the `PATH` / `WORDS` / `HEADLINE` lines and the `META` lines; never read the notes.
+
+**Feed note** (`FEED_NOTE`), following the format in its own prompt callout (that callout is the source of truth; if it differs from below, follow it):
+
+- New run goes at the top of the feed, after the prompt and watchlist, under `## YYYY-MM`, heading `### [[MM-DD-YY ddd]]`
 - Collapse the previous run into a `> [!note]- [[date]]` callout (prefix its lines with `> `)
-- `> [!tldr]` first: "N videos from X, Y, Z. Common thread: …" Only if there really is one.
-- One collapsed `> [!note]-` per video, titled `Channel: Title (47m)`; body is the subagent's TLDR, POINTS, QUOTE, then `[Watch](url)` and, if deep, the `[[full note]]`
-- Skipped (no captions) and backlog entries as a final plain list of titles + links
-- Set `unread: true`, update `updated:`
-- No `# Title` heading, per vault rules
+- One collapsed callout per video:
+  ```
+  > [!note]- <Channel>: <Title> (47m)
+  > <HEADLINE>
+  >
+  > [[<NOTE NAME>]] · [Watch](<url>)
+  ```
+- No-caption and backlog videos as a final plain list of titles + `[Watch](url)`
+- Set `unread: true`, update `updated:`. No `# Title` heading
 
-Then update state and the daily note:
+**Creator hub** per video (creates `08 Summaries/<Channel>/<Channel>.md` if missing, newest first, skips duplicates):
+
+```bash
+python3 "$SCRIPTS/plan.py" hub --vault "$VAULT_ROOT" --channel "<channel>" --title "<title>" --date <uploaded> --headline "<HEADLINE>"
+```
+
+**Bases** (only if `$VAULT_ROOT/_Bases/posts.base` exists): for a creator new to the vault, add a named view to `posts.base` and embed it in their person note, exactly like summarize Step 6.
+
+**Daily note** (`02 Daily/YYYY/MM/MM-DD-YY ddd.md`, create if needed with `unread: true`):
+
+```markdown
+## creator digest
+- [[📺 Creator Feed]] — N notes: [[Note 1]], [[Note 2]], ...
+```
+
+## Step 7: State and cleanup
 
 ```bash
 python3 "$SCRIPTS/discover.py" mark --state "$VAULT_ROOT/$STATE_FILE" --status done <ids...>
@@ -110,37 +197,29 @@ python3 "$SCRIPTS/discover.py" mark --state "$VAULT_ROOT/$STATE_FILE" --status s
 python3 "$SCRIPTS/discover.py" finish --state "$VAULT_ROOT/$STATE_FILE"
 ```
 
-Only `mark` videos that actually made it into the digest, so a failed run retries them. Then add to the daily note (summarize Step 7 format):
+`done` = a note now exists for it (written this run, or `STATUS exists`). `skipped` = no captions. A worker that failed is **not** marked, so the next run retries it. Delete `SCRATCH`.
 
-```markdown
-## creator digest
-- [[📺 Creator Feed]] — N videos: <theme list>
-```
-
-Delete `SCRATCH`.
-
-## Cost controls (why this is cheap)
+## Cost controls
 
 | Lever | Effect |
 |---|---|
-| Discovery + transcripts are scripts | 0 tokens until a transcript is actually worth reading |
-| `max_videos` cap + backlog | Hard ceiling per run; overflow waits instead of spiking |
+| Discovery, transcripts, planning, verification are scripts | 0 tokens until a transcript is read by its worker |
+| Orchestrator never reads transcripts or notes | Main context stays small however many videos run |
+| One Sonnet worker per video, no fan-out | Cost scales with transcript length, nothing more |
+| `max_videos` cap + backlog | **The main control**: each video is now a full note (a 2-hour podcast is a 5k-8k word note). Keep it at 3-4 for scheduled runs |
 | `min_minutes` / `max_minutes` | Drops Shorts and 8-hour streams before anything is read |
-| Person/topic hits must literally match | Search noise dies in the script |
-| Seen-state | A video is never summarized twice, even if it surfaces from two sources |
-| Transcript by file path, one Sonnet per video | Main context never holds transcripts; no Opus |
-| Digest-only by default, `deep` opt-in | Full notes only for what you chose |
+| Seen-state + `STATUS exists` | A video is never summarized twice |
 | No audio transcription when scheduled | The expensive fallback never runs unattended |
 | Empty run = no writes | Quiet days cost ~nothing |
 
-Tuning: if spend is still too high, lower `max_videos`, set `per_source` to 5, drop `topic:` lines (the noisiest), or move channels off `deep`.
+Tuning: lower `max_videos`, set `per_source` to 5, drop `topic:` lines (the noisiest), or lower `max_minutes` to skip long podcasts.
 
 ## Key rules
 
 1. Never prompt in a scheduled run; every choice comes from the watchlist or flags
-2. Scripts find and fetch; the model only reads transcripts to write takeaways
-3. Never put a transcript in the main context
-4. Never Haiku. Sonnet for digest entries, `summarize minimal` for deep
-5. Only `mark` what landed in the digest
+2. The orchestrator never reads a transcript or a finished note; scripts print only short lines
+3. One Sonnet worker per video. Never Haiku, never a bigger model, never a per-section fan-out
+4. Person notes: create if missing and the name has 2+ words (noclobber), otherwise append one line dated with the upload date
+5. Only `mark` what has a note (done) or no captions (skipped)
 6. No `# Title` headings; `unread: true` on every note touched
-7. Never skip silently: no-captions and backlog videos are listed by title
+7. Never skip silently: no-caption and backlog videos are listed by title

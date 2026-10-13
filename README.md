@@ -5,7 +5,7 @@ A collection of skills I use with Claude Code to improve my life in various ways
 ## Skills
 
 - [`summarize/`](./summarize) — drop in a YouTube video, article, PDF, EPUB, or podcast and it writes a summary note into your vault with wikilinks to every person and concept mentioned. Asks detailed vs minimal mode on each run — detailed creates reference notes for every wikilink, minimal leaves them dangling and saves ~85% tokens.
-- [`creator-digest/`](./creator-digest) — turns `summarize` into a scheduled feed. List the channels, people, and topics you follow in one vault note; every few days it finds their new videos itself (no pasted links), fetches transcripts with scripts, and writes a compact takeaway digest. Mark a channel `deep` for full `/summarize` notes. Capped and script-driven so it stays cheap.
+- [`creator-digest/`](./creator-digest) — turns `summarize` into a scheduled feed. List the channels, people, and topics you follow in one vault note; every few days it finds their new videos itself (no pasted links), fetches transcripts with scripts, and has one Sonnet worker per video write a full summary note (summarize minimal format), linked from the feed, a per-creator hub note, and the daily note. Capped by `max_videos`; the main conversation never reads transcripts.
 - [`summarize-call/`](./summarize-call) — drop in a call recording (video or audio) and it transcribes with speaker labels, summarizes, and writes a call note + transcript + person notes for the participants. Same detailed / minimal mode as `summarize`.
 
 ## Daily Briefs 

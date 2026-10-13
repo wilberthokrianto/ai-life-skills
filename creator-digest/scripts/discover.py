@@ -299,17 +299,19 @@ def cmd_find(a):
         if gated and not any(s["kind"] in ("channel", "subscriptions") for s in srcs):
             if not any(matches(s, m) and m["views"] >= int(s["opts"].get("min_views", 0) or 0) for s in gated):
                 stats["irrelevant"] += 1; continue
-        m = dict(m, deep=any(s["opts"].get("deep") for s in srcs),
-                 sources=sorted({f"{s['kind']}:{s['value']}" for s in srcs} or []))
+        if any(s["opts"].get("deep") for s in srcs):
+            progress(f"note: '| deep' is ignored now (every video gets a full note): {vid}")
+        write = next((s["opts"]["write"] for s in srcs if isinstance(s["opts"].get("write"), str)), "")
+        m = dict(m, write=write, sources=sorted({f"{s['kind']}:{s['value']}" for s in srcs} or []))
         m.pop("desc", None)
         pool[vid] = m
     for vid, b in backlog_prev.items():
         if vid not in pool and vid not in seen:
             pool[vid] = b
-    # deep channels first, then explicit channels over searches, then newest
+    # explicit channels over searches, then newest
     def rank(m):
         explicit = any(s.startswith(("channel:", "subscriptions:")) for s in m.get("sources", []))
-        return (not m.get("deep"), not explicit, m.get("uploaded", "") and -int(m["uploaded"].replace("-", "")))
+        return (not explicit, m.get("uploaded", "") and -int(m["uploaded"].replace("-", "")))
     ordered = sorted(pool.values(), key=rank)
     process, backlog = ordered[:settings["max_videos"]], ordered[settings["max_videos"]:]
     state["backlog"] = [dict(b, queued=b.get("queued", today.isoformat())) for b in backlog]
